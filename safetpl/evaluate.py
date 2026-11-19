@@ -1,9 +1,4 @@
-"""safetpl.evaluate —— 白名单表达式求值器的契约与初始桩。
-
-本文件只声明契约，不提供实现：五个公开函数初始全部 ``raise
-NotImplementedError``，因此 ``python -m pytest tests -q`` 的 15 个用例
-全红。实现时只允许使用标准库（ast、operator、re、time 等）与 pytest，
-不联网、不启动外部进程、不依赖第三方包。
+"""safetpl.evaluate —— 白名单表达式求值器。
 
 安全模型（这是契约，不是真正的操作系统沙箱）：
 
@@ -17,160 +12,409 @@ NotImplementedError``，因此 ``python -m pytest tests -q`` 的 15 个用例
 from __future__ import annotations
 
 import ast
+import operator
+import re
+import time
 
 
 class UnsafeExpression(Exception):
     """表达式或模板不安全、语法非法，或超出资源上限时抛出。"""
 
 
+# 显式拒绝的危险双下划线名（开头下划线规则已覆盖，这里便于审计）。
+_DANGEROUS_ATTRIBUTES = frozenset({
+    "__class__",
+    "__mro__",
+    "__subclasses__",
+    "__globals__",
+    "__code__",
+    "__builtins__",
+})
+
+# 允许出现的 AST 节点类型；其余一律拒绝。
+_ALLOWED_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.Call,
+    ast.Name,
+    ast.Constant,
+    ast.Attribute,
+    ast.Subscript,
+    ast.IfExp,
+    ast.List,
+    ast.Tuple,
+    ast.Dict,
+    # 辅助节点
+    ast.Load,
+    ast.Store,
+    ast.And,
+    ast.Or,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.UAdd,
+    ast.USub,
+    ast.Not,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.In,
+    ast.NotIn,
+    ast.Is,
+    ast.IsNot,
+    ast.keyword,
+)
+
+_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+
+_UNARY_OPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+    ast.Not: operator.not_,
+}
+
+_CMP_OPS = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.In: lambda a, b: a in b,
+    ast.NotIn: lambda a, b: a not in b,
+    ast.Is: operator.is_,
+    ast.IsNot: operator.is_not,
+}
+
+# printf 风格转换模式：%(name)s / %s / %5d / %-10s 等；单独的 % 文本不算。
+_PRINTF_RE = re.compile(
+    r"%\([^)]+\)[#0\- +]*\d*(?:\.\d+)?[diouxXeEfFgGcrs]"
+    r"|%[#0\-+]*\d*(?:\.\d+)?[diouxXeEfFgGcrs]"
+)
+
+# 求值中由用户表达式引发、需要统一转换的异常。
+_USER_ERRORS = (
+    ZeroDivisionError,
+    TypeError,
+    KeyError,
+    IndexError,
+    AttributeError,
+    ValueError,
+)
+
+_MAX_POW_EXPONENT = 1024
+
+
+def _check_attribute_name(name: object, attributes) -> None:
+    """校验属性名；违规抛 UnsafeExpression。"""
+    if not isinstance(name, str) or not name:
+        raise UnsafeExpression("attribute name must be a non-empty string")
+    if name.startswith("_"):
+        raise UnsafeExpression(f"attribute {name!r} is not allowed")
+    if name in _DANGEROUS_ATTRIBUTES:
+        raise UnsafeExpression(f"attribute {name!r} is not allowed")
+    if name not in attributes:
+        raise UnsafeExpression(f"attribute {name!r} is not in the whitelist")
+
+
 def check_ast(tree: ast.AST, policy: dict) -> None:
-    """静态校验 AST；通过返回 None，违规抛 UnsafeExpression。
+    """静态校验 AST；通过返回 None，违规抛 UnsafeExpression。"""
+    max_depth = policy.get("max_ast_depth", 100)
+    functions = policy.get("functions", {})
+    attributes = policy.get("attributes", ())
 
-    契约：
+    counter = [0]
+    active: set[int] = set()  # 当前递归路径上的节点 id，用于检测环
 
-    * ``tree`` 应是 ``ast.parse(expr, mode="eval")`` 得到的
-      ``ast.Expression``。
-    * 仅允许以下表达式节点及其运算符/上下文辅助节点：
-      ``Expression``、``BinOp``、``UnaryOp``、``BoolOp``、``Compare``、
-      ``Call``、``Name``、``Constant``、``Attribute``、``Subscript``、
-      ``IfExp``、``List``、``Tuple``、``Dict``；辅助节点包括
-      ``Load``/``Store``、``And``/``Or``、``Add``/``Sub``/``Mult``/
-      ``Div``/``FloorDiv``/``Mod``/``Pow``、``UAdd``/``USub``/``Not``、
-      ``Eq``/``NotEq``/``Lt``/``LtE``/``Gt``/``GtE``/``In``/``NotIn``/
-      ``Is``/``IsNot``。
-    * 以下节点一律拒绝：``Lambda``、``ListComp``/``SetComp``/``DictComp``/
-      ``GeneratorExp``、``Await``、``Yield``/``YieldFrom``、``Starred``、
-      ``Import``/``ImportFrom``、``JoinedStr``/``FormattedValue``
-      （f-string）、``NamedExpr``（海象运算符），以及其他任何未列出的
-      节点类型。
-    * ``ast.Name``：``id`` 不得以 ``"_"`` 开头；当它作为 ``ast.Call``
-      的 ``func`` 时，名字必须出现在 ``policy["functions"]`` 中。
-      ``policy["functions"]`` 是 ``{名字: 可调用对象}`` 形式的白名单。
-    * ``ast.Call``：``func`` 必须是 ``ast.Name``，即只允许直接调用
-      白名单函数；方法调用（``func`` 为 ``ast.Attribute``，例如
-      ``"...".format(...)``、``"...".__class__()``）一律拒绝。
-      关键字参数允许，但 ``*args``/``**kwargs``（``Starred``）拒绝。
-      函数名不在 ``policy["functions"]`` 中 -> UnsafeExpression。
-    * ``ast.Attribute``：``attr`` 必须满足 safe_getattr 的名字规则
-      （不以 ``"_"`` 开头、不是危险双下划线名、在
-      ``policy["attributes"]`` 中），否则 UnsafeExpression。
-    * ``ast.Constant``：仅允许 str/int/float/bool/None，其他类型拒绝。
-    * 深度与递归：每访问一个节点计数一次，超过
-      ``policy.get("max_ast_depth", 100)`` -> UnsafeExpression。
-      对同一对象在当前递归路径上重复出现（手工构造的环）也必须抛
-      ``UnsafeExpression``，不能抛 ``RecursionError`` 或死循环。
-    """
-    raise NotImplementedError("check_ast 尚未实现")
+    def visit(node: ast.AST) -> None:
+        counter[0] += 1
+        if counter[0] > max_depth:
+            raise UnsafeExpression(
+                f"AST node count exceeds the limit of {max_depth}"
+            )
+        node_id = id(node)
+        if node_id in active:
+            raise UnsafeExpression("recursive AST reference detected")
+        active.add(node_id)
+        try:
+            if not isinstance(node, _ALLOWED_NODES):
+                raise UnsafeExpression(
+                    f"node type {type(node).__name__} is not allowed"
+                )
+            if isinstance(node, ast.Name):
+                if node.id.startswith("_"):
+                    raise UnsafeExpression(f"name {node.id!r} is not allowed")
+            elif isinstance(node, ast.Call):
+                if not isinstance(node.func, ast.Name):
+                    raise UnsafeExpression(
+                        "only direct calls to whitelisted functions are allowed"
+                    )
+                if node.func.id not in functions:
+                    raise UnsafeExpression(
+                        f"function {node.func.id!r} is not in the whitelist"
+                    )
+            elif isinstance(node, ast.Attribute):
+                _check_attribute_name(node.attr, attributes)
+            elif isinstance(node, ast.Constant):
+                if not isinstance(node.value, (str, int, float, bool, type(None))):
+                    raise UnsafeExpression(
+                        f"constant of type {type(node.value).__name__} "
+                        "is not allowed"
+                    )
+            for child in ast.iter_child_nodes(node):
+                visit(child)
+        finally:
+            active.discard(node_id)
+
+    visit(tree)
 
 
 def safe_getattr(obj: object, name: str, policy: dict) -> object:
-    """按策略读取对象属性，成功时返回属性值，违规抛 UnsafeExpression。
-
-    契约：
-
-    * ``name`` 必须是 str 且非空。
-    * 名字以 ``"_"`` 开头（包括所有双下划线名称）-> UnsafeExpression。
-    * 名字命中危险列表 ``{"__class__", "__mro__", "__subclasses__",
-      "__globals__", "__code__", "__builtins__"}`` -> UnsafeExpression
-      （双下划线已被上一条覆盖，这里仍显式拒绝，便于审计）。
-    * 名字必须出现在 ``policy["attributes"]``（集合或序列）中，否则
-      UnsafeExpression；只允许白名单里的属性名。
-    * 通过检查后返回 ``getattr(obj, name)``。属性本身不存在时让
-      ``AttributeError`` 自然抛出，这属于普通求值错误，不是安全违规。
-    """
-    raise NotImplementedError("safe_getattr 尚未实现")
+    """按策略读取对象属性，成功时返回属性值，违规抛 UnsafeExpression。"""
+    _check_attribute_name(name, policy.get("attributes", ()))
+    return getattr(obj, name)
 
 
 def evaluate(expr: str, ctx: dict, policy: dict, limits: dict) -> object:
-    """解析、静态校验并受限求值单个表达式，返回结果。
+    """解析、静态校验并受限求值单个表达式，返回结果。"""
+    if not isinstance(expr, str) or not expr.strip():
+        raise UnsafeExpression("expression must be a non-empty string")
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except (SyntaxError, ValueError, TypeError) as exc:
+        raise UnsafeExpression(f"invalid expression syntax: {exc}") from exc
 
-    ``limits`` 必须包含以下键：
+    check_ast(tree, policy)
 
-    * ``max_depth``：本次求值允许访问的最大节点数（递归计数，每进入
-      一个 AST 节点加一）。
-    * ``max_str``：字符串结果的最大长度。
-    * ``max_list``：list/tuple 结果的最大元素数。
-    * ``max_dict``：dict 结果的最大条目数。
-    * ``max_seconds``：``time.monotonic`` 单调时钟预算（秒，float）；
-      ``<= 0`` 立即视为预算耗尽。
+    max_depth = limits["max_depth"]
+    max_str = limits["max_str"]
+    max_list = limits["max_list"]
+    max_dict = limits["max_dict"]
+    max_seconds = limits["max_seconds"]
+    if max_seconds <= 0:
+        raise UnsafeExpression("time budget exhausted")
+    deadline = time.monotonic() + max_seconds
 
-    流程契约：
+    functions = policy.get("functions", {})
+    counter = [0]
 
-    1. 用 ``ast.parse(expr, mode="eval")`` 解析；``SyntaxError``/
-       ``ValueError``/``TypeError`` 一律转为 UnsafeExpression（空表达式
-       同样拒绝）。
-    2. 调用 ``check_ast(tree, policy)`` 做静态校验。
-    3. 记录 ``deadline = time.monotonic() + max_seconds``；每次进入一个
-       节点前检查一次 ``time.monotonic() > deadline``，超时抛
-       UnsafeExpression。访问节点数超过 ``max_depth`` 同样抛
-       UnsafeExpression。
-    4. 受限求值规则：
-       * ``Name``：只能从 ``ctx`` 取值；名字以下划线开头或缺失 ->
-         UnsafeExpression。
-       * ``Constant``：返回原值。
-       * ``Attribute``：``safe_getattr(对象, attr, policy)``。
-       * ``Subscript``：只允许 int/str 下标；``Slice`` 不支持，越界、
-         类型错误等转为 UnsafeExpression。
-       * ``Call``：只允许 ``func`` 为 ``ast.Name`` 且名字在
-         ``policy["functions"]`` 中；取对应的可调用对象，逐个受限求值
-         参数后调用。方法调用一律 UnsafeExpression。
-       * ``BinOp``/``UnaryOp``/``BoolOp``/``Compare``/``IfExp``/
-         ``List``/``Tuple``/``Dict``：用 ``operator`` 模块实现白名单
-         运算；不支持的运算符 -> UnsafeExpression。
-       * ``Mult`` 在真正执行前预检：若一侧是 str/tuple/list、另一侧是
-         int，且按重复次数算出的长度超过 ``max_str``/``max_list``，
-         直接抛 UnsafeExpression，绝不能先分配再检查
-         （``"a" * 10**9`` 必须被提前拦下）。
-       * ``Pow``：整数指数绝对值大于 1024 -> UnsafeExpression，避免
-         构造超大整数。
-    5. 每次得到结果都检查大小上限：str 长度 <= ``max_str``；list/tuple
-       元素数 <= ``max_list``；dict 条目数 <= ``max_dict``；超限抛
-       UnsafeExpression。最终结果同样检查。
-    6. 求值过程中由用户表达式引发的 ``ZeroDivisionError``、``TypeError``、
-       ``KeyError``、``IndexError``、``AttributeError`` 统一转为
-       UnsafeExpression（避免把内部细节泄漏给模板调用方）。
-    """
-    raise NotImplementedError("evaluate 尚未实现")
+    def check_size(value: object) -> object:
+        if isinstance(value, str) and len(value) > max_str:
+            raise UnsafeExpression(
+                f"string result exceeds the limit of {max_str} characters"
+            )
+        if isinstance(value, (list, tuple)) and len(value) > max_list:
+            raise UnsafeExpression(
+                f"sequence result exceeds the limit of {max_list} elements"
+            )
+        if isinstance(value, dict) and len(value) > max_dict:
+            raise UnsafeExpression(
+                f"dict result exceeds the limit of {max_dict} entries"
+            )
+        return value
+
+    def visit(node: ast.AST) -> object:
+        counter[0] += 1
+        if counter[0] > max_depth:
+            raise UnsafeExpression(
+                f"evaluation node count exceeds the limit of {max_depth}"
+            )
+        if time.monotonic() > deadline:
+            raise UnsafeExpression("time budget exhausted")
+
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant):
+            return check_size(node.value)
+        if isinstance(node, ast.Name):
+            if node.id.startswith("_") or node.id not in ctx:
+                raise UnsafeExpression(f"name {node.id!r} is not available")
+            return check_size(ctx[node.id])
+        if isinstance(node, ast.Attribute):
+            return check_size(
+                safe_getattr(visit(node.value), node.attr, policy)
+            )
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.slice, ast.Slice):
+                raise UnsafeExpression("slices are not supported")
+            target = visit(node.value)
+            index = visit(node.slice)
+            if not isinstance(index, (int, str)):
+                raise UnsafeExpression("only int/str subscripts are allowed")
+            return check_size(target[index])
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise UnsafeExpression(
+                    "only direct calls to whitelisted functions are allowed"
+                )
+            func = functions.get(node.func.id)
+            if func is None:
+                raise UnsafeExpression(
+                    f"function {node.func.id!r} is not in the whitelist"
+                )
+            args = [visit(arg) for arg in node.args]
+            kwargs = {kw.arg: visit(kw.value) for kw in node.keywords}
+            return check_size(func(*args, **kwargs))
+        if isinstance(node, ast.BinOp):
+            op_type = type(node.op)
+            func = _BIN_OPS.get(op_type)
+            if func is None:
+                raise UnsafeExpression(
+                    f"operator {op_type.__name__} is not supported"
+                )
+            left = visit(node.left)
+            right = visit(node.right)
+            if op_type is ast.Mult:
+                _precheck_mult(left, right, max_str, max_list)
+            if op_type is ast.Pow:
+                if isinstance(right, int) and abs(right) > _MAX_POW_EXPONENT:
+                    raise UnsafeExpression("exponent is too large")
+            return check_size(func(left, right))
+        if isinstance(node, ast.UnaryOp):
+            func = _UNARY_OPS.get(type(node.op))
+            if func is None:
+                raise UnsafeExpression(
+                    f"operator {type(node.op).__name__} is not supported"
+                )
+            return check_size(func(visit(node.operand)))
+        if isinstance(node, ast.BoolOp):
+            if isinstance(node.op, ast.And):
+                result = None
+                for value_node in node.values:
+                    result = visit(value_node)
+                    if not result:
+                        return result
+                return result
+            if isinstance(node.op, ast.Or):
+                result = None
+                for value_node in node.values:
+                    result = visit(value_node)
+                    if result:
+                        return result
+                return result
+            raise UnsafeExpression(
+                f"operator {type(node.op).__name__} is not supported"
+            )
+        if isinstance(node, ast.Compare):
+            left = visit(node.left)
+            for op, comparator in zip(node.ops, node.comparators):
+                func = _CMP_OPS.get(type(op))
+                if func is None:
+                    raise UnsafeExpression(
+                        f"operator {type(op).__name__} is not supported"
+                    )
+                right = visit(comparator)
+                if not func(left, right):
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.IfExp):
+            if visit(node.test):
+                return check_size(visit(node.body))
+            return check_size(visit(node.orelse))
+        if isinstance(node, ast.List):
+            return check_size([visit(elt) for elt in node.elts])
+        if isinstance(node, ast.Tuple):
+            return check_size(tuple(visit(elt) for elt in node.elts))
+        if isinstance(node, ast.Dict):
+            result = {}
+            for key_node, value_node in zip(node.keys, node.values):
+                if key_node is None:
+                    raise UnsafeExpression("dict unpacking is not allowed")
+                result[visit(key_node)] = visit(value_node)
+            return check_size(result)
+        raise UnsafeExpression(
+            f"node type {type(node).__name__} is not supported"
+        )
+
+    try:
+        return check_size(visit(tree))
+    except UnsafeExpression:
+        raise
+    except _USER_ERRORS as exc:
+        raise UnsafeExpression(f"evaluation failed: {exc}") from exc
+
+
+def _precheck_mult(left: object, right: object, max_str: int, max_list: int) -> None:
+    """在执行 ``*`` 之前预检重复构造的大小，避免先分配再检查。"""
+    for seq, count in ((left, right), (right, left)):
+        if (
+            isinstance(seq, (str, list, tuple))
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+        ):
+            limit = max_str if isinstance(seq, str) else max_list
+            if count > 0 and len(seq) * count > limit:
+                raise UnsafeExpression(
+                    f"repetition would produce {len(seq) * count} elements, "
+                    f"exceeding the limit of {limit}"
+                )
 
 
 def render(template: str, ctx: dict, policy: dict, limits: dict) -> str:
-    """渲染只含 ``{{ expr }}`` 占位符的模板，返回字符串。
+    """渲染只含 ``{{ expr }}`` 占位符的模板，返回字符串。"""
+    if _PRINTF_RE.search(template):
+        raise UnsafeExpression("printf-style % formatting is not allowed")
 
-    契约：
+    max_str = limits["max_str"]
+    out: list[str] = []
+    i = 0
+    n = len(template)
+    while i < n:
+        if template.startswith("{{", i):
+            end = template.find("}}", i + 2)
+            if end == -1:
+                raise UnsafeExpression("unclosed placeholder")
+            inner = template[i + 2 : end]
+            if "{{" in inner:
+                raise UnsafeExpression("nested placeholder is not allowed")
+            expr = inner.strip()
+            if not expr:
+                raise UnsafeExpression("empty placeholder is not allowed")
+            value = evaluate(expr, ctx, policy, limits)
+            out.append(str(value))
+            i = end + 2
+        elif template[i] in "{}":
+            raise UnsafeExpression(
+                "single braces (str.format style) are not allowed"
+            )
+        else:
+            out.append(template[i])
+            i += 1
 
-    * 只支持 ``{{ expr }}`` 占位符；占位符之外的文本原样输出。
-    * 从 ``{{`` 开始找最近的 ``}}``；若在它之前又出现 ``{{``，属于
-      嵌套占位符 -> UnsafeExpression。
-    * 找不到匹配的 ``}}`` -> 未闭合占位符，UnsafeExpression；孤立的
-      ``}}`` 同样 UnsafeExpression。
-    * 占位符内表达式为空（只有空白）-> UnsafeExpression。
-    * 禁止 Python ``str.format`` 风格的单花括号字段（例如
-      ``{0.__class__}``）：占位符之外出现 ``{`` 或 ``}`` 一律
-      UnsafeExpression。
-    * 禁止 printf 风格 ``%`` 格式化（例如 ``%s``、``%(name)s``、``%d``）：
-      模板任意位置命中转换模式 -> UnsafeExpression；单独的百分号文本
-      不算。
-    * 每个占位符表达式交给 ``evaluate(expr, ctx, policy, limits)`` 求值，
-      结果用 ``str()`` 转成文本拼接。最终渲染结果长度也不得超过
-      ``limits["max_str"]``，超限 -> UnsafeExpression。
-    * 不支持占位符转义；``{{{{`` 之类的写法按嵌套/未闭合规则拒绝。
-    """
-    raise NotImplementedError("render 尚未实现")
+    result = "".join(out)
+    if len(result) > max_str:
+        raise UnsafeExpression(
+            f"rendered output exceeds the limit of {max_str} characters"
+        )
+    return result
 
 
 def explain(expr: str, policy: dict) -> list[str]:
-    """返回表达式被拒绝的原因列表（用于审计），合法表达式返回 []。
-
-    契约：
-
-    * 用 ``ast.parse(expr, mode="eval")`` 加 ``check_ast(tree, policy)``
-      做静态检查。
-    * 遇到 ``SyntaxError`` 或 ``UnsafeExpression`` 时，返回非空的原因
-      列表（人类可读字符串，例如
-      ``"attribute '__class__' is not allowed"``、
-      ``"function 'getattr' is not in the whitelist"``）；本函数不向
-      调用方抛异常。
-    * 合法表达式返回空列表 ``[]``。
-    * 只做静态分析，不求值、不读取 ctx、不消耗时间预算。
-    """
-    raise NotImplementedError("explain 尚未实现")
+    """返回表达式被拒绝的原因列表（用于审计），合法表达式返回 []。"""
+    try:
+        tree = ast.parse(expr, mode="eval")
+        check_ast(tree, policy)
+    except (SyntaxError, ValueError, TypeError) as exc:
+        return [f"invalid expression syntax: {exc}"]
+    except UnsafeExpression as exc:
+        return [str(exc)]
+    return []
